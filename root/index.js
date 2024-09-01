@@ -13,57 +13,61 @@ const {
     DELETE_SOURCE_FILE = '1', // remove the original file after conversion?
     DELETE_MISC_FILES = '1', // delete non-video and non subtitle files?
     VIDEO_ACCEL_API = 'va', // acceleration api to be used: va,qsv,nvenc or vulkan
-    VIDEO_SHOW_PROGRESS = '1'
+    VIDEO_SHOW_PROGRESS = '1',
+    FOLDER_CLEAN_DEPTH = '1'
   } = process.env;
 
 const queue = []
 const deleteSourceFile = DELETE_SOURCE_FILE === '1';
 const deleteMiscFiles = DELETE_MISC_FILES === '1';
 const videoShowProgresss = VIDEO_SHOW_PROGRESS === '1';
+const folderCleanDepth = Number(FOLDER_CLEAN_DEPTH);
 
 let working = false
 
 // Watch for new files in the WATCH_DIR
-console.log(`[+] Watching '${WATCH_DIR}' for new video files`);
+async function removeEmptyDirectories(dirPath, depth = 0) {
+//  console.error(`cleaning ${dirPath}`);
+  try {
+      // Get list of directory entries with types (files/directories)
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
-function deleteEmptySubfolders(directory) {
-    // Get the immediate subdirectories of the given directory
-    
-    const firstLevelDirs = fs.readdirSync(directory).map(name => path.join(directory, name)).filter(source => fs.lstatSync(source).isDirectory());
+      // Traverse through the directory contents
+      for (const entry of entries) {
+          const entryPath = path.join(dirPath, entry.name);
 
-    // Function to recursively delete empty folders
-    function deleteEmptyFolders(dir) {
-        // Get all items in the directory
-        const files = fs.readdirSync(dir);
+          // If it's a directory, recurse into it
+          if (entry.isDirectory()) {
+              // Recursively remove empty directories, increasing depth
+              await removeEmptyDirectories(entryPath, depth + 1);
 
-        // Recursively delete subfolders
-        files.forEach(file => {
-            const fullPath = path.join(dir, file);
-            if (fs.lstatSync(fullPath).isDirectory()) {
-                deleteEmptyFolders(fullPath);
-            }
-        });
-
-        // After deleting subfolders, check if the directory is empty
-        if (fs.readdirSync(dir).length === 0 && !firstLevelDirs.includes(dir)) {
-            fs.rmdirSync(dir);
-            console.log(`Deleted empty folder: ${dir}`);
-        }
-    }
-
-    // Start the deletion process for each first-level directory
-    firstLevelDirs.forEach(subdir => {
-        const subSubDirs = fs.readdirSync(subdir).map(name => path.join(subdir, name)).filter(source => fs.lstatSync(source).isDirectory());
-
-        subSubDirs.forEach(deleteEmptyFolders);
-    });
+              // After recursion, check if the directory is now empty
+              const isEmpty = (await fs.readdir(entryPath)).length === 0;
+              if (isEmpty && depth >= folderCleanDepth) {
+                  // If the directory is empty and not at the first level, remove it
+                  await fs.rmdir(entryPath);
+               //   console.log(`Removed empty directory: ${entryPath} E:${isEmpty} D:${depth}`);
+              } else {
+              //  console.log(`Keeping directory: ${entryPath} E:${isEmpty} D:${depth}`);
+              }
+          }
+      }
+  } catch (err) {
+      console.error(`Error processing directory ${dirPath}: ${err.message}`);
+  }
+//  console.error(`cleaned ${dirPath}`);
 }
 
 function cleanup() {
-  deleteEmptySubfolders(WATCH_DIR)
-  deleteEmptySubfolders(TEMP_DIR)
+  (async () => {
+    if (folderCleanDepth >= 0) {
+      await removeEmptyDirectories(WATCH_DIR);
+      await removeEmptyDirectories(TEMP_DIR);
+    }
+  })();
 }
 
+cleanup();
 setInterval(() => {
   if (working)
     return;
@@ -107,6 +111,7 @@ setInterval(() => {
           working = false;
         }
       }
+      cleanup();
       working = false;
     })
     .on('error', err => {
@@ -147,6 +152,7 @@ setInterval(() => {
           working = false;
         }
       }
+      cleanup();
       working = false;
     })
     .on('error', err => {
@@ -184,6 +190,7 @@ setInterval(() => {
           working = false;
         }
       }
+      cleanup();
       working = false;
     })
     .on('error', err => {
@@ -235,6 +242,7 @@ setInterval(() => {
         working = false;
       }
     }
+    cleanup();
     working = false;
   })
   .on('error', err => {
@@ -269,6 +277,7 @@ setInterval(() => {
           working = false;
         }
       }
+      cleanup();
       working = false;
     })
     .on('error', err => {
@@ -281,7 +290,6 @@ setInterval(() => {
     })
     .run();
   }
-
 }, 5000);
 
 chokidar
