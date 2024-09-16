@@ -1,334 +1,384 @@
+// Import required modules
 const chokidar = require('chokidar');
 const fs = require('fs').promises;
 const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
 
-const {
-    WATCH_DIR = '/watch', // place to look for new video files
-    TEMP_DIR = '/temp', // scratch buffer for ffmpeg, location of converting files
-    COMPLETE_DIR = '/ready', // where should the converted video files be moved to?
-    WORK_DEVICE = '/dev/dri/renderD128', // device to be used to do the work set to "vulkan=vk:0" for vulkan
-    VIDEO_BIT_RATE = '4M', // bitrate or quality index for qsv e.g 25
-    VIDEO_CODEC = 'av1', // the codec or library when doing cpu transcode
-    DELETE_SOURCE_FILE = '1', // remove the original file after conversion?
-    DELETE_MISC_FILES = '1', // delete non-video and non subtitle files?
-    VIDEO_ACCEL_API = 'va', // acceleration api to be used: va,qsv,nvenc or vulkan
-    VIDEO_SHOW_PROGRESS = '1',
-    FOLDER_CLEAN_DEPTH = '1'
-  } = process.env;
+// Supported file extensions
+const videoExtensions = ['.mp4', '.mkv', '.m4v'];
+const subtitleExtensions = ['.srt', '.ass', '.sub', '.ssa', '.smi', '.vtt'];
 
-const queue = []
-const deleteSourceFile = DELETE_SOURCE_FILE === '1';
-const deleteMiscFiles = DELETE_MISC_FILES === '1';
-const videoShowProgresss = VIDEO_SHOW_PROGRESS === '1';
-const folderCleanDepth = Number(FOLDER_CLEAN_DEPTH);
+// Utility functions
+function parseEnvBoolean(value, defaultValue = false) {
+  if (value === undefined) return defaultValue;
+  return value === '1' || value.toLowerCase() === 'true';
+}
 
-let working = false
+function parseEnvInt(value, defaultValue = 0) {
+  const parsed = parseInt(value, 10);
+  return isNaN(parsed) ? defaultValue : parsed;
+}
 
-// Watch for new files in the WATCH_DIR
-async function removeEmptyDirectories(dirPath, depth = 0) {
-//  console.error(`cleaning ${dirPath}`);
+// Configuration
+const config = {
+  // Directories
+  watchDir: process.env.WATCH_DIR || '/watch',
+  tempDir: process.env.TEMP_DIR || '/temp',
+  completeDir: process.env.COMPLETE_DIR || '/ready',
+
+  // Video encoding settings
+  videoBitRate: process.env.VIDEO_BIT_RATE || '4M',
+  videoCodec: process.env.VIDEO_CODEC || 'av1',
+  videoAccelApi: process.env.VIDEO_ACCEL_API || 'va',
+  workDevice: process.env.WORK_DEVICE || '/dev/dri/renderD128',
+
+  // Processing options
+  deleteSourceFile: parseEnvBoolean(process.env.DELETE_SOURCE_FILE, true),
+  deleteMiscFiles: parseEnvBoolean(process.env.DELETE_MISC_FILES, true),
+  videoShowProgress: parseEnvBoolean(process.env.VIDEO_SHOW_PROGRESS, true),
+  videoSkipReencode: parseEnvBoolean(process.env.VIDEO_SKIP_REENCODE, true),
+  folderCleanDepth: parseEnvInt(process.env.FOLDER_CLEAN_DEPTH, 1),
+  videoSampleSeconds: parseEnvInt(process.env.VIDEO_SAMPLE_SECONDS, 300),
+};
+
+// Processing queue and state
+const queue = [];
+let processing = false;
+
+// Recursive function to change permissions
+async function chmodRecursive(dirPath, mode = 0o777) {
   try {
-      // Get list of directory entries with types (files/directories)
+    const stats = await fs.stat(dirPath);
+    await fs.chmod(dirPath, mode);
+    if (stats.isDirectory()) {
       const entries = await fs.readdir(dirPath, { withFileTypes: true });
-
-      // Traverse through the directory contents
       for (const entry of entries) {
-          const entryPath = path.join(dirPath, entry.name);
-
-          // If it's a directory, recurse into it
-          if (entry.isDirectory()) {
-              // Recursively remove empty directories, increasing depth
-              await removeEmptyDirectories(entryPath, depth + 1);
-
-              // After recursion, check if the directory is now empty
-              const isEmpty = (await fs.readdir(entryPath)).length === 0;
-              if (isEmpty && depth >= folderCleanDepth) {
-                  // If the directory is empty and not at the first level, remove it
-                  await fs.rmdir(entryPath);
-               //   console.log(`Removed empty directory: ${entryPath} E:${isEmpty} D:${depth}`);
-              } else {
-              //  console.log(`Keeping directory: ${entryPath} E:${isEmpty} D:${depth}`);
-              }
-          }
+        const entryPath = path.join(dirPath, entry.name);
+        await chmodRecursive(entryPath, mode);
       }
+    }
   } catch (err) {
-      console.error(`Error processing directory ${dirPath}: ${err.message}`);
+    console.error(`Error changing permissions for '${dirPath}':`, err.message);
   }
-//  console.error(`cleaned ${dirPath}`);
 }
 
-function cleanup() {
-  (async () => {
-    if (folderCleanDepth >= 0) {
-      await removeEmptyDirectories(WATCH_DIR);
-      await removeEmptyDirectories(TEMP_DIR);
+// Recursive function to remove empty directories
+async function removeEmptyDirectories(dirPath, depth = 0) {
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    let isEmpty = true;
+
+    for (const entry of entries) {
+      const entryPath = path.join(dirPath, entry.name);
+
+      if (entry.isDirectory()) {
+        await removeEmptyDirectories(entryPath, depth + 1);
+        const subEntries = await fs.readdir(entryPath);
+        if (subEntries.length === 0 && depth >= config.folderCleanDepth) {
+          await fs.rmdir(entryPath);
+          console.log(`Removed empty directory: ${entryPath}`);
+        } else {
+          isEmpty = false;
+        }
+      } else {
+        isEmpty = false;
+      }
     }
-  })();
+
+    if (isEmpty && depth >= config.folderCleanDepth) {
+      await fs.rmdir(dirPath);
+      console.log(`Removed empty directory: ${dirPath}`);
+    }
+  } catch (err) {
+    console.error(`Error processing directory ${dirPath}: ${err.message}`);
+  }
 }
 
-cleanup();
-setInterval(() => {
-  if (working)
-    return;
+// Promisified ffprobe
+function ffprobeAsync(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return reject(err);
+      resolve(data);
+    });
+  });
+}
 
-  const filepath = queue.shift();
-
-  if (typeof filepath === 'undefined')
-    return;
-
-  working = true;
-
-  const newpath = filepath.replace(WATCH_DIR, COMPLETE_DIR);
-  const temppath = filepath.replace(WATCH_DIR, TEMP_DIR);
-
-  console.log(`Converting '${filepath}'`);
-  
-  if (VIDEO_ACCEL_API == 'qsv') {
-    ffmpeg(filepath)
-    .inputOptions([
-      '-hwaccel', 'qsv',
-      '-hwaccel_device', WORK_DEVICE,
-    ])
-    .outputOptions([
-      '-c:v', VIDEO_CODEC + '_qsv',
-      '-global_quality', VIDEO_BIT_RATE,
-      '-c:a', 'copy',
-      '-c:s', 'copy'
-    ])
-    .output(temppath)
-    .on('end', async () => {
-      console.log(`Processing finished for '${filepath}'`);
-      if (deleteSourceFile) {
-        try {
-          await fs.copyFile(temppath, newpath)
-          await fs.unlink(temppath);
-          console.log(`Moved file '${temppath}' to file '${newpath}'`);
-          await fs.unlink(filepath);
-          console.log(`Deleted source file '${filepath}'`);
-        } catch (err) {
-          console.error(`Error deleting source file '${filepath}':`, err.message);
-          working = false;
-        }
+// Check if the file is in the target codec
+async function isTargetCodec(filePath) {
+  try {
+    const metadata = await ffprobeAsync(filePath);
+    const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+    if (videoStream) {
+      const videoCodec = videoStream.codec_name.toLowerCase();
+      console.log(`Video Codec: ${videoCodec}`);
+      if (config.videoCodec.includes(videoCodec)) {
+        return true;
       }
-      cleanup();
-      working = false;
-    })
-    .on('error', err => {
-      console.error('Error during processing:', err.message);
-      working = false;
-    })
-    .on('progress', (progress) => {
-      if (videoShowProgresss)
-        console.log('Processing: ' + progress.percent + '% done at ' + progress.currentFps + ' fps');
-    })
-    .run();
-  } else if (VIDEO_ACCEL_API == 'va') {
-    ffmpeg(filepath)
-    .inputOptions([
-      '-hwaccel', 'vaapi',
-      '-hwaccel_device', WORK_DEVICE,
-      '-hwaccel_output_format', 'vaapi'
-    ])
-    .outputOptions([
-      '-vf', 'format=nv12|vaapi,hwupload',
-      '-c:v', VIDEO_CODEC + '_vaapi',
-      '-b:v', VIDEO_BIT_RATE,
-      '-c:a', 'copy',
-      '-c:s', 'copy'
-    ])
-    .output(temppath)
-    .on('end', async () => {
+    }
+    return false;
+  } catch (err) {
+    console.error('Error reading metadata:', err.message);
+    return false;
+  }
+}
+
+// Detect if the video is a sample
+async function detectSample(filePath) {
+  try {
+    const metadata = await ffprobeAsync(filePath);
+    const { format } = metadata;
+    if (config.videoSampleSeconds > format.duration) {
+      console.log(`'${filePath}' is shorter than ${config.videoSampleSeconds} seconds; treating as sample`);
+      return true;
+    }
+    console.log(`'${filePath}' is a valid video file`);
+    return false;
+  } catch (err) {
+    console.error('Error reading metadata:', err.message);
+    return false;
+  }
+}
+
+// Cleanup function to remove empty directories
+async function cleanup() {
+  if (config.folderCleanDepth >= 0) {
+    await removeEmptyDirectories(config.watchDir);
+    await removeEmptyDirectories(config.tempDir);
+  }
+}
+
+// Process the queue of files
+async function processQueue() {
+  if (processing || queue.length === 0) return;
+
+  processing = true;
+
+  while (queue.length > 0) {
+    const filepath = queue.shift();
+    try {
+      await processFile(filepath);
+    } catch (err) {
+      console.error(`Error processing file '${filepath}':`, err.message);
+    }
+  }
+
+  processing = false;
+}
+
+// Add a file to the processing queue
+function addToQueue(filepath) {
+  queue.push(filepath);
+  processQueue();
+}
+
+// Get ffmpeg command based on configuration
+function getFfmpegCommand(inputPath, outputPath) {
+  let command = ffmpeg(inputPath);
+
+  const videoCodec = config.videoCodec;
+  const videoBitRate = config.videoBitRate;
+
+  switch (config.videoAccelApi) {
+    case 'qsv':
+      console.log('Using QuickSync to encode this file.');
+      command
+        .inputOptions([
+          '-hwaccel_device', config.workDevice,
+          '-hwaccel_output_format', 'qsv'
+        ])
+        .outputOptions([
+          '-c:v', `${videoCodec}_qsv`,
+          '-global_quality', videoBitRate,
+          '-gpu_copy', 'on',
+          '-c:a', 'copy',
+          '-c:s', 'copy'
+        ]);
+      break;
+    case 'va':
+      console.log('Using VA-API to encode this file.');
+      command
+        .inputOptions([
+          '-hwaccel', 'vaapi',
+          '-hwaccel_device', config.workDevice,
+          '-hwaccel_output_format', 'vaapi'
+        ])
+        .outputOptions([
+          '-vf', 'format=nv12|vaapi,hwupload',
+          '-c:v', `${videoCodec}_vaapi`,
+          '-b:v', videoBitRate,
+          '-c:a', 'copy',
+          '-c:s', 'copy'
+        ]);
+      break;
+    case 'nvenc':
+      console.log('Using NVENC to encode this file.');
+      command
+        .inputOptions([
+          '-hwaccel', 'nvdec'
+        ])
+        .outputOptions([
+          '-c:v', `${videoCodec}_nvenc`,
+          '-b:v', videoBitRate,
+          '-c:a', 'copy',
+          '-c:s', 'copy'
+        ]);
+      break;
+    case 'vulkan':
+      console.log('Using Vulkan to encode this file.');
+      command
+        .inputOptions([
+          '-hwaccel', 'vulkan',
+          '-init_hw_device', config.workDevice,
+          '-hwaccel_output_format', 'vulkan'
+        ])
+        .outputOptions([
+          '-vf', 'format=nv12,hwupload,vulkan',
+          '-c:v', videoCodec,
+          '-b:v', videoBitRate,
+          '-c:a', 'copy',
+          '-c:s', 'copy'
+        ]);
+      break;
+    default:
+      console.log('Using CPU to encode this file.');
+      command
+        .outputOptions([
+          '-c:v', videoCodec,
+          '-b:v', videoBitRate,
+          '-c:a', 'copy',
+          '-c:s', 'copy'
+        ]);
+      break;
+  }
+
+  command.output(outputPath);
+  return command;
+}
+
+// Process a single file
+async function processFile(filepath) {
+  const newpath = filepath.replace(config.watchDir, config.completeDir);
+  const temppath = filepath.replace(config.watchDir, config.tempDir);
+
+  console.log(`Processing '${filepath}'`);
+
+  await fs.mkdir(path.dirname(newpath), { recursive: true });
+  await fs.mkdir(path.dirname(temppath), { recursive: true });
+
+  let command = getFfmpegCommand(filepath, temppath);
+
+  return new Promise((resolve, reject) => {
+    command.on('end', async () => {
       console.log(`Processing finished for '${filepath}'`);
-      if (deleteSourceFile) {
-        try {
-          await fs.copyFile(temppath, newpath)
-          await fs.unlink(temppath);
-          console.log(`Moved file '${temppath}' to file '${newpath}'`);
-          await fs.unlink(filepath);
-          console.log(`Deleted source file '${filepath}'`);
-        } catch (err) {
-          console.error(`Error deleting source file '${filepath}':`, err.message);
-          working = false;
-        }
-      }
-      cleanup();
-      working = false;
-    })
-    .on('error', err => {
-      console.error('Error during processing:', err.message);
-      working = false;
-    })
-    .on('progress', (progress) => {
-      if (videoShowProgresss)
-        console.log('Processing: ' + progress.percent + '% done at ' + progress.currentFps + ' fps');
-    })
-    .run();
-  } else if (VIDEO_ACCEL_API == 'nvenc') {
-    ffmpeg(filepath)
-    .inputOptions([
-      '-hwaccel', 'nvdec'
-    ])
-    .outputOptions([
-      '-c:v', VIDEO_CODEC + '_nvenc',
-      '-b:v', VIDEO_BIT_RATE,
-      '-c:a', 'copy',
-      '-c:s', 'copy'
-    ])
-    .output(temppath)
-    .on('end', async () => {
-      console.log(`Processing finished for '${filepath}'`);
-      if (deleteSourceFile) {
-        try {
-          await fs.copyFile(temppath, newpath)
-          await fs.unlink(temppath);
-          console.log(`Moved file '${temppath}' to file '${newpath}'`);
-          await fs.unlink(filepath);
-          console.log(`Deleted source file '${filepath}'`);
-        } catch (err) {
-          console.error(`Error deleting source file '${filepath}':`, err.message);
-          working = false;
-        }
-      }
-      cleanup();
-      working = false;
-    })
-    .on('error', err => {
-      console.error('Error during processing:', err.message);
-      working = false;
-    })
-    .on('progress', (progress) => {
-      if (videoShowProgresss)
-        console.log('Processing: ' + progress.percent + '% done at ' + progress.currentFps + ' fps');
-    })
-    .run();
-  } else if (VIDEO_ACCEL_API == 'vulkan') {
-/*docker run --rm -it \
-  --device=/dev/dri:/dev/dri \
-  -v $(pwd):/config \
-  -e ANV_VIDEO_DECODE=1 \
-  linuxserver/ffmpeg \
-  -init_hw_device "vulkan=vk:0" \
-  -hwaccel vulkan \
-  -hwaccel_output_format vulkan \
-  -i /config/input.mkv \
-  -f null - -benchmark*/
-    /* ffmpeg -hwaccel vulkan -i input.mp4 -vf "format=nv12,hwupload,vulkan" -c:v h264 output.mp4*/
-  ffmpeg(filepath)
-  .inputOptions([
-    '-hwaccel', 'vulkan',
-    '-init_hw_device', WORK_DEVICE,
-    '-hwaccel_output_format', 'vulkan'
-  ])
-  .outputOptions([
-    '-vf',  'format=nv12,hwupload,vulkan',
-    '-c:v', VIDEO_CODEC,
-    '-b:v', VIDEO_BIT_RATE,
-    '-c:a', 'copy',
-    '-c:s', 'copy'
-  ])
-  .output(temppath)
-  .on('end', async () => {
-    console.log(`Processing finished for '${filepath}'`);
-    if (deleteSourceFile) {
       try {
-        await fs.copyFile(temppath, newpath)
+        await fs.copyFile(temppath, newpath);
         await fs.unlink(temppath);
-        console.log(`Moved file '${temppath}' to file '${newpath}'`);
-        await fs.unlink(filepath);
-        console.log(`Deleted source file '${filepath}'`);
-      } catch (err) {
-        console.error(`Error deleting source file '${filepath}':`, err.message);
-        working = false;
-      }
-    }
-    cleanup();
-    working = false;
-  })
-  .on('error', err => {
-    console.error('Error during processing:', err.message);
-    working = false;
-  })
-  .on('progress', (progress) => {
-    if (videoShowProgresss)
-      console.log('Processing: ' + progress.percent + '% done at ' + progress.currentFps + ' fps');
-  })
-  .run();
-  } else { /* cpu transcode */
-    ffmpeg(filepath)
-    .outputOptions([
-      '-c:v', VIDEO_CODEC,
-      '-b:v', VIDEO_BIT_RATE,
-      '-c:a', 'copy',
-      '-c:s', 'copy'
-    ])
-    .output(temppath)
-    .on('end', async () => {
-      console.log(`Processing finished for '${filepath}'`);
-      if (deleteSourceFile) {
-        try {
-          await fs.copyFile(temppath, newpath)
-          await fs.unlink(temppath);
-          console.log(`Moved file '${temppath}' to file '${newpath}'`);
+        console.log(`Moved file '${temppath}' to '${newpath}'`);
+        if (config.deleteSourceFile) {
           await fs.unlink(filepath);
           console.log(`Deleted source file '${filepath}'`);
-        } catch (err) {
-          console.error(`Error deleting source file '${filepath}':`, err.message);
-          working = false;
         }
+      } catch (err) {
+        console.error(`Error handling files: ${err.message}`);
       }
       cleanup();
-      working = false;
+      resolve();
     })
     .on('error', err => {
       console.error('Error during processing:', err.message);
-      working = false;
+      queue.push(filepath);
+      reject(err);
     })
-    .on('progress', (progress) => {
-      if (videoShowProgresss)
-        console.log('Processing: ' + progress.percent + '% done at ' + progress.currentFps + ' fps');
-    })
-    .run();
-  }
-}, 5000);
+    .on('progress', progress => {
+      if (config.videoShowProgress)
+        console.log(`Processing: ${progress.percent}% done at ${progress.currentFps} fps`);
+    });
 
+    command.run();
+  });
+}
+
+// Check if the file is a work file
+function isWorkFile(filepath) {
+  return filepath.includes('/.') || filepath.includes('.queued') || filepath.includes('_UNPACK_');
+}
+
+// Check if the extension is a video file
+function isVideoFile(extension) {
+  return videoExtensions.includes(extension);
+}
+
+// Check if the extension is a subtitle file
+function isSubtitleFile(extension) {
+  return subtitleExtensions.includes(extension);
+}
+
+// Handle file addition
+async function handleFileAdd(filepath) {
+  try {
+    if (isWorkFile(filepath)) {
+      console.log(`Ignoring '${filepath}' because it is a work file`);
+      return;
+    }
+
+    const extension = path.extname(filepath).toLowerCase();
+    await chmodRecursive(filepath);
+
+    const newpath = filepath.replace(config.watchDir, config.completeDir);
+    await fs.mkdir(path.dirname(newpath), { recursive: true });
+
+    if (isVideoFile(extension)) {
+      console.log(`'${filepath}' looks like a video file`);
+
+      if (await detectSample(filepath)) {
+        console.log(`Ignoring '${filepath}' because it looks like a sample file`);
+        return;
+      }
+
+      if (config.videoSkipReencode && await isTargetCodec(filepath)) {
+        try {
+          await fs.copyFile(filepath, newpath);
+          await fs.unlink(filepath);
+          console.log(`Moved '${filepath}' to '${newpath}' because it's already in the target codec`);
+        } catch (err) {
+          console.error(`Error handling file '${filepath}':`, err.message);
+        }
+        return;
+      }
+
+      addToQueue(filepath);
+    } else if (isSubtitleFile(extension)) {
+      try {
+        await fs.copyFile(filepath, newpath);
+        await fs.unlink(filepath);
+        console.log(`Moved subtitle file '${filepath}' to '${newpath}'`);
+      } catch (err) {
+        console.error(`Error handling file '${filepath}':`, err.message);
+      }
+    } else if (config.deleteMiscFiles) {
+      try {
+        await fs.unlink(filepath);
+        console.log(`Removed '${filepath}' because it was of unknown type and deleteMiscFiles was set`);
+      } catch (err) {
+        console.error(`Error handling file '${filepath}':`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error(`Error processing file '${filepath}':`, err.message);
+  }
+}
+
+// Initial cleanup
+cleanup();
+
+// Start watching the watch directory
 chokidar
-  .watch(WATCH_DIR, {
+  .watch(config.watchDir, {
     persistent: true,
     ignoreInitial: false,
     awaitWriteFinish: true,
     ignored: '(?<![^/])\\.',
     depth: 99
   })
-  .on('add', async filepath => {
-    const newpath = filepath.replace(WATCH_DIR, COMPLETE_DIR);
-    const temppath = filepath.replace(WATCH_DIR, TEMP_DIR);
-    await fs.mkdir(path.dirname(newpath), { recursive: true });
-    await fs.mkdir(path.dirname(temppath), { recursive: true });
-  
-    const extension = path.extname(filepath);
-
-    if (filepath.includes('/.') || filepath.includes('.queued')|| filepath.includes('_UNPACK_')) {
-      console.log(`Ignoring '${filepath}' because it is a work file`);
-      return;
-    }
-
-    if (['.mp4', '.mkv', '.m4v'].includes(extension)) {
-      queue.push(filepath);
-    } else if (['.srt', '.ass', '.sub', '.ssa', '.smi', '.vtt'].includes(extension)) {
-      try {
-          await fs.copyFile(filepath, newpath)
-          await fs.unlink(filepath);
-          console.log(`Moved '${filepath}' to '${newpath}'`);
-      } catch (err) {
-        console.error(`Error handling file '${filepath}':`, err.message);
-      }
-    } else if (deleteMiscFiles) {
-      try {
-        await fs.unlink(filepath);
-        console.log(`Removed '${filepath}' because it was of unknown type and deletemiscfiles was set`);
-      } catch (err) {
-        console.error(`Error handling file '${filepath}':`, err.message);
-      }
-    }
-  });
+  .on('add', handleFileAdd);
