@@ -14,50 +14,53 @@ ENV \
 
 # versions
 ENV \
-  AOM=v3.9.1 \
+  AOM=v3.11.0 \
   FDKAAC=2.0.3 \
-  FFMPEG_HARD=7.0.2 \
+  FFMPEG_HARD=7.1 \
   FONTCONFIG=2.15.0 \
   FREETYPE=2.13.3 \
-  FRIBIDI=1.0.15 \
-  GMMLIB=22.3.20 \
-  HARFBUZZ=9.0.0 \
-  IHD=24.2.5 \
+  FRIBIDI=1.0.16 \
+  GMMLIB=22.5.2 \
+  HARFBUZZ=10.1.0 \
+  IHD=24.3.4 \
   KVAZAAR=2.3.1 \
   LAME=3.100 \
   LIBASS=0.17.3 \
-  LIBDAV1D=1.4.3 \
+  LIBDAV1D=1.5.0 \
   LIBDOVI=2.1.2 \
-  LIBDRM=2.4.122 \
+  LIBDRM=2.4.123 \
   LIBGL=1.7.0 \
+  LIBLC3=1.1.1 \
   LIBMFX=22.5.4 \
   LIBPLACEBO=7.349.0 \
-  LIBPNG=1.6.43 \
+  LIBPNG=1.6.44 \
   LIBVA=2.22.0 \
   LIBVDPAU=1.5 \
   LIBVIDSTAB=1.1.1 \
   LIBVMAF=3.0.0 \
-  LIBVPL=2.12.0 \
-  MESA=24.2.0 \
+  LIBVPL=2.13.0 \
+  MESA=24.3.0 \
   NVCODEC=n12.2.72.0 \
   OGG=1.3.5 \
   OPENCOREAMR=0.1.6 \
   OPENJPEG=2.5.2 \
   OPUS=1.5.2 \
   RAV1E=0.7.1 \
-  RIST=0.2.10 \
-  SHADERC=v2024.1 \
-  SRT=1.5.3 \
-  SVTAV1=2.1.2 \
+  RIST=0.2.11 \
+  SHADERC=v2024.3 \
+  SRT=1.5.4 \
+  SVTAV1=2.3.0 \
   THEORA=1.1.1 \
   VORBIS=1.3.7 \
-  VPLGPURT=24.2.5 \
-  VPX=1.14.1 \
-  VULKANSDK=vulkan-sdk-1.3.290.0 \
+  VPLGPURT=24.3.4 \
+  VPX=1.15.0 \
+  VULKANSDK=vulkan-sdk-1.3.296.0 \
+  VVENC=1.12.1 \
   WEBP=1.4.0 \
-  X265=3.6 \
+  X265=4.1 \
   XVID=1.3.7 \
-  ZIMG=3.0.5
+  ZIMG=3.0.5 \
+  ZMQ=v4.3.5
 
 RUN \
   echo "**** install build packages ****" && \
@@ -459,7 +462,7 @@ RUN \
   echo "**** compiling libvpl ****" && \
   mkdir -p /tmp/libvpl/build && \
   cd /tmp/libvpl/build && \
-  cmake .. && \ 
+  cmake .. && \
   cmake --build . --config Release && \
   cmake --build . --config Release --target install && \
   strip -d /usr/local/lib/libvpl.so
@@ -476,7 +479,7 @@ RUN \
   cmake \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_INSTALL_LIBDIR=/usr/local/lib \
-    .. && \ 
+    .. && \
   make && \
   make install && \
   strip -d /usr/local/lib/libmfx-gen.so
@@ -497,7 +500,7 @@ RUN \
     -DENABLE_X11_DRI3=ON \
     -DBUILD_DISPATCHER=OFF \
     -DBUILD_TUTORIALS=OFF \
-    .. && \ 
+    .. && \
   make && \
   make install && \
   strip -d \
@@ -820,7 +823,7 @@ RUN \
 RUN \
   echo "**** compiling xvid ****" && \
   cd /tmp/xvid/build/generic && \
-  ./configure && \ 
+  ./configure && \
   make && \
   make install
 RUN \
@@ -839,6 +842,32 @@ RUN \
     --enable-shared && \
   make && \
   make install
+RUN \
+  echo "**** grabbing zmq ****" && \
+  mkdir -p /tmp/zmq && \
+  git clone \
+    --branch ${ZMQ} --depth 1 \
+    https://github.com/zeromq/libzmq.git \
+    /tmp/zmq
+RUN \
+  echo "**** compiling zmq ****" && \
+  cd /tmp/zmq && \
+  ./autogen.sh && \
+  ./configure \
+    --disable-static \
+    --enable-shared && \
+  make && \
+  make install-strip
+RUN \
+  echo "**** grabbing AMF Headers ****" && \
+  mkdir -p /tmp/amf
+RUN git clone \
+    --branch master --depth 1 \
+    https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git \
+    /tmp/amf
+RUN mkdir -p /usr/local/include/AMF
+RUN cp -a /tmp/amf/amf/public/include/* /usr/local/include/AMF/
+RUN ls /usr/local/include/AMF
 
 # main ffmpeg build
 RUN \
@@ -862,6 +891,7 @@ RUN \
     --disable-doc \
     --disable-ffplay \
     --enable-alsa \
+    --enable-cuda-llvm \
     --enable-cuvid \
     --enable-ffprobe \
     --enable-gpl \
@@ -898,17 +928,33 @@ RUN \
     --enable-libxml2 \
     --enable-libxvid \
     --enable-libzimg \
+    --enable-libzmq \
     --enable-nonfree \
     --enable-nvdec \
     --enable-nvenc \
-    --enable-cuda-llvm \
+    --enable-amf \
     --enable-opencl \
     --enable-openssl \
     --enable-stripping \
     --enable-vaapi \
     --enable-vdpau \
     --enable-version3 \
-    --enable-vulkan && \
+    --enable-vulkan \
+    --enable-runtime-cpudetect \
+    --enable-lto \
+    --enable-mmx \
+    --enable-sse \
+    --enable-sse2 \
+    --enable-sse3 \
+    --enable-ssse3 \
+    --enable-sse4 \
+    --enable-avx \
+    --enable-avx2 \
+    --enable-avx512 \
+    --enable-xop \
+    --enable-fma3 \
+    --enable-fma4 \
+    && \
   make
 
 RUN \
@@ -969,8 +1015,6 @@ RUN \
     'libnvidia-opencl.so.1' > \
     /buildout/etc/OpenCL/vendors/nvidia.icd
 
-  
-
 # runtime stage
 FROM ghcr.io/linuxserver/baseimage-ubuntu:noble
 
@@ -991,6 +1035,21 @@ ENV \
   LD_LIBRARY_PATH="/usr/local/lib" \
   NVIDIA_DRIVER_CAPABILITIES="compute,video,utility" \
   NVIDIA_VISIBLE_DEVICES="all"
+
+  RUN \
+  echo "**** install amd deps ****" && \
+    apt-get update && \
+    apt-get install -y \
+    wget \
+    rsync
+
+# Download the AMD GPU-Pro driver (replace with the correct URL for your driver)
+RUN wget https://repo.radeon.com/amdgpu-install/6.2.3/ubuntu/noble/amdgpu-install_6.2.60203-1_all.deb
+RUN chmod 777 amdgpu-install_6.2.60203-1_all.deb
+RUN dpkg -i amdgpu-install_6.2.60203-1_all.deb
+
+# Install the AMD GPU-Pro driver with AMF/VCE support
+RUN amdgpu-install -y --accept-eula --vulkan=pro --opencl=rocr --usecase=dkms,graphics,opencl,hip,amf
 
 RUN \
   echo "**** install runtime ****" && \
@@ -1031,8 +1090,7 @@ RUN \
   /usr/local/bin/ffmpeg -version
 
 RUN apt-get update && apt-get install -y \
-  && apt-get install -y nodejs npm
-
+  && apt-get install -y nodejs npm p7zip-full
 # Verify Node.js and npm installation
 RUN node -v && npm -v
 
@@ -1042,4 +1100,3 @@ COPY /root /
 RUN npm install
 
 ENTRYPOINT ["/ffmpegwrapper.sh"]
-
